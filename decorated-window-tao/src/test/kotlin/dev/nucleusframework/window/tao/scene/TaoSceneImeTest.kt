@@ -119,6 +119,20 @@ class TaoSceneImeTest {
         }
 
     @Test
+    fun `an empty commit keeps the live composition`() =
+        runTaoSceneTest {
+            val field = focusedField()
+            imePreedit("にほんご")
+            // A conversion that fails sends `insertText:` carrying only Apple
+            // corporate (function-key) characters, so the payload filters down
+            // to nothing. Committing it would wipe the composing region.
+            imeCommit("")
+            assertEquals("にほんご", field.value, "an empty commit must not wipe the preedit")
+            val request = assertNotNull(inputMethodRequest)
+            assertNotNull(request.value().composition, "the composition must stay active")
+        }
+
+    @Test
     fun `typing after a commit works normally`() =
         runTaoSceneTest {
             val field = focusedField()

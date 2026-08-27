@@ -64,10 +64,15 @@ internal class TaoImeSession(
      * Commits [text] in place of the composing region. Called for
      * `insertText:` while marked text is active — not for ordinary typing,
      * which still travels `ReceivedImeText` → KEY_TYPED.
+     *
+     * An empty [text] is never a commit: `commitText("")` would drop the
+     * composing region and leave the preedit duplicated in the field. The
+     * native side already swallows payloads that filter down to nothing, so
+     * this is a belt-and-braces guard.
      */
     fun commit(text: String) {
         val request = activeRequest ?: return
-        if (!isComposing && text.isEmpty()) return
+        if (text.isEmpty()) return
         isComposing = false
         request.editText {
             commitText(text, 1)
@@ -80,7 +85,11 @@ internal class TaoImeSession(
      * `DesktopTextInputService2` / JDK-8074882). Falls back to a typed-key
      * sequence when no text-input session is up yet.
      */
-    fun replaceCommit(text: String) {
+    fun replaceCommit(rawText: String) {
+        // Apple corporate (function-key) characters must never reach the field:
+        // they render as tofu, and `deleteSurroundingTextInCodePoints` would
+        // still remove a real character before "inserting" them (#595).
+        val text = rawText.filterNot { it in '\uF700'..'\uF8FF' }
         if (text.isEmpty()) return
         val request = activeRequest
         if (request != null) {

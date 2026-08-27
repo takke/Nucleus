@@ -139,6 +139,7 @@ static unsigned short g_base_key_code = 0xFFFF;
 static IMP g_orig_insert_text = NULL;
 static IMP g_orig_key_up = NULL;
 static IMP g_orig_attributed_substring = NULL;
+static IMP g_orig_selected_range = NULL;
 static void (*g_ime_replace_commit)(long ns_view, const char *utf8) = NULL;
 
 void nucleus_tao_register_ime_replace_commit(void (*cb)(long, const char *)) {
@@ -167,14 +168,24 @@ static void nucleus_note_press_and_hold_query(void) {
     }
 }
 
-// Tao's `selectedRange` returns `{NSNotFound, 0}` ("no text storage"). Some
-// AppKit code paths interpret that as "this view doesn't host text" and skip
-// IME-related machinery. Returning `{0, 0}` matches AWT-managed text views.
-// PressAndHold also reads this after the base letter is committed — that
-// query is how we detect the picker (Compose AWT uses getSelectedText).
+// Tao's `selectedRange` returns `{NSNotFound, 0}` ("no text storage") when
+// nothing is composing. Some AppKit code paths interpret that as "this view
+// doesn't host text" and skip IME-related machinery. Returning `{0, 0}`
+// matches AWT-managed text views. PressAndHold also reads this after the base
+// letter is committed — that query is how we detect the picker (Compose AWT
+// uses getSelectedText).
+//
+// Nucleus patch (nucleusframework#595 follow-up): while a composition is live,
+// Tao's own `selectedRange` reports the caret *inside* the preedit, which is
+// the answer high-function IMEs (ATOK, Kotoeri live conversion) cross-check
+// against `markedRange`. Pinning it to `{0, 0}` there contradicts
+// `markedRange` and desyncs them, so delegate in that case and keep the
+// PressAndHold answer only for the no-composition path.
 static NSRange tao_view_selected_range(id self, SEL _cmd) {
-    (void)self; (void)_cmd;
     nucleus_note_press_and_hold_query();
+    if (g_orig_selected_range && [(NSView<NSTextInputClient> *)self hasMarkedText]) {
+        return ((NSRange (*)(id, SEL))g_orig_selected_range)(self, _cmd);
+    }
     return NSMakeRange(0, 0);
 }
 
@@ -219,6 +230,24 @@ static void nucleus_insert_text(id self, SEL sel, id string, NSRange replacement
     BOOL isLetterDown = nucleus_is_letter_key_event(event);
     BOOL isRepeat = event && event.isARepeat;
     BOOL sameAsBase = (g_base_text != nil) && [incoming isEqualToString:g_base_text];
+
+    // Nucleus patch (nucleusframework#595 follow-up): a marked-text IME
+    // (Japanese, Chinese, ...) commits through insertText: while the view
+    // still holds the preedit. That is never PressAndHold: its picker only
+    // engages on a plain committed letter, outside any composition
+    // (JDK-8074882 flow). Without this gate a segment commit that lands
+    // while the next romaji key is down is registered as a "base letter",
+    // the IME's own selectedRange queries then look like the picker starting,
+    // and the *next* commit is hijacked into the replace-commit path —
+    // deleting a code point, skipping ImeCommit, and leaving the preedit
+    // stranded (visible as duplicated segments and U+F7xx tofu).
+    if ([(NSView<NSTextInputClient> *)self hasMarkedText]) {
+        nucleus_clear_press_and_hold();
+        if (g_orig_insert_text) {
+            ((void (*)(id, SEL, id, NSRange))g_orig_insert_text)(self, sel, string, replacement);
+        }
+        return;
+    }
 
     // First repeat / selectedRange query: PressAndHold re-inserts the base
     // letter. Swallow it or we consume the replace flag and the accent
@@ -270,10 +299,19 @@ static void nucleus_tao_swizzle_view_methods_once(void) {
     if (!taoViewClass) return;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        class_replaceMethod(taoViewClass,
-                            @selector(selectedRange),
-                            (IMP)tao_view_selected_range,
-                            "{_NSRange=QQ}@:");
+        // Keep Tao's implementation reachable — `tao_view_selected_range`
+        // delegates to it while a composition is active.
+        Method selectedRange =
+            class_getInstanceMethod(taoViewClass, @selector(selectedRange));
+        if (selectedRange) {
+            g_orig_selected_range =
+                method_setImplementation(selectedRange, (IMP)tao_view_selected_range);
+        } else {
+            class_replaceMethod(taoViewClass,
+                                @selector(selectedRange),
+                                (IMP)tao_view_selected_range,
+                                "{_NSRange=QQ}@:");
+        }
         class_replaceMethod(taoViewClass,
                             @selector(firstRectForCharacterRange:actualRange:),
                             (IMP)tao_view_first_rect_for_character_range,

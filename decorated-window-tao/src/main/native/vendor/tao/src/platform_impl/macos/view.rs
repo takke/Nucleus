@@ -75,6 +75,13 @@ pub(super) struct ViewState {
   /// that the key-press cancelled the ime session. (Except arrow keys)
   key_triggered_ime: bool,
 
+  /// Selection the IME placed inside the current preedit, in UTF-16 code
+  /// units. `markedRange` reports the preedit at location 0, so this doubles
+  /// as the document selection while composing (Nucleus patch,
+  /// nucleusframework#595 follow-up). Only meaningful while `markedText` is
+  /// non-empty.
+  ime_selected_range: NSRange,
+
   /// The last `keyDown` was consumed by the IME. The matching `keyUp`
   /// must not be forwarded either (Nucleus patch, nucleusframework#595).
   ime_consumed_keydown: bool,
@@ -102,6 +109,7 @@ pub fn new_view(ns_window: &NSWindow) -> (Option<Retained<NSView>>, Weak<Mutex<C
     ime_spot: None,
     in_ime_preedit: false,
     key_triggered_ime: false,
+    ime_selected_range: util::EMPTY_RANGE,
     ime_consumed_keydown: false,
     is_key_down: false,
     modifiers: Default::default(),
@@ -431,17 +439,38 @@ extern "C" fn marked_range(this: &Object, _sel: Sel) -> NSRange {
     let length = marked_text.length();
     trace!("Completed `markedRange`");
     if length > 0 {
-      NSRange::new(0, length - 1)
+      // Nucleus patch (nucleusframework#595 follow-up): the marked range spans
+      // the *whole* preedit. Reporting `length - 1` hid the last UTF-16 unit
+      // from the input method; ATOK / Kotoeri live conversion cross-check this
+      // against their own buffer, desync, and then commit nothing. Matches
+      // winit's `markedRange`.
+      NSRange::new(0, length)
     } else {
       util::EMPTY_RANGE
     }
   }
 }
 
-extern "C" fn selected_range(_this: &Object, _sel: Sel) -> NSRange {
+extern "C" fn selected_range(this: &Object, _sel: Sel) -> NSRange {
   trace!("Triggered `selectedRange`");
-  trace!("Completed `selectedRange`");
-  util::EMPTY_RANGE
+  unsafe {
+    // Nucleus patch (nucleusframework#595 follow-up): while a composition is
+    // live the insertion point sits *inside* the marked text, which
+    // `markedRange` reports starting at 0 — so the range the IME handed us in
+    // `setMarkedText:selectedRange:` is already in document coordinates.
+    // Claiming "no selection" there contradicts `markedRange` and is what
+    // desyncs high-function IMEs. With no marked text we keep the documented
+    // `{NSNotFound, 0}`, like winit.
+    let marked_text: &NSMutableAttributedString = *this.get_ivar("markedText");
+    if marked_text.length() == 0 {
+      trace!("Completed `selectedRange`");
+      return util::EMPTY_RANGE;
+    }
+    let state_ptr: *mut c_void = *this.get_ivar("taoState");
+    let state = &*(state_ptr as *mut ViewState);
+    trace!("Completed `selectedRange`");
+    state.ime_selected_range
+  }
 }
 
 /// An IME pre-edit operation happened, changing the text that's
@@ -451,7 +480,7 @@ extern "C" fn set_marked_text(
   this: &mut Object,
   _sel: Sel,
   string: id,
-  _selected_range: NSRange,
+  selected_range: NSRange,
   _replacement_range: NSRange,
 ) {
   trace!("Triggered `setMarkedText`");
@@ -468,6 +497,7 @@ extern "C" fn set_marked_text(
         &*(string as *const NSString),
       )
     };
+    let marked_length = marked_text.length();
     let marked_text_ref: &mut *mut NSMutableAttributedString = this.get_mut_ivar("markedText");
     let () = msg_send![(*marked_text_ref), release];
     *marked_text_ref = Retained::into_raw(marked_text);
@@ -476,6 +506,14 @@ extern "C" fn set_marked_text(
     let state = &mut *(state_ptr as *mut ViewState);
     state.in_ime_preedit = true;
     state.key_triggered_ime = true;
+
+    // Nucleus patch (nucleusframework#595 follow-up): remember where the IME
+    // put its caret so `selectedRange` can answer truthfully. Clamp: IMEs are
+    // known to send offsets past the end of the marked text, and handing such
+    // a range back to AppKit raises `NSRangeException`.
+    let sel_location = selected_range.location.min(marked_length);
+    let sel_length = selected_range.length.min(marked_length - sel_location);
+    state.ime_selected_range = NSRange::new(sel_location, sel_length);
 
     // Nucleus patch (nucleusframework#595): forward the preedit to the app.
     // The IME's inner selection is not representable through Compose's
@@ -486,6 +524,13 @@ extern "C" fn set_marked_text(
     } else {
       (*(string as *const NSString)).to_string()
     };
+    // Nucleus patch (nucleusframework#595 follow-up): a preedit can carry
+    // Apple corporate (function-key) characters, which reach the text field as
+    // tofu. Drop them exactly like `insertText:` already does.
+    let preedit: String = preedit
+      .chars()
+      .filter(|c| !is_corporate_character(*c))
+      .collect();
     queue_window_event(state, WindowEvent::ImePreedit(preedit));
   }
   trace!("Completed `setMarkedText`");
@@ -499,6 +544,7 @@ extern "C" fn unmark_text(this: &mut Object, _sel: Sel) {
     let state_ptr: *mut c_void = *this.get_ivar("taoState");
     let state = &mut *(state_ptr as *mut ViewState);
     cancel_preedit(state);
+    state.ime_selected_range = util::EMPTY_RANGE;
 
     let marked_text_ref: &mut *mut NSMutableAttributedString = this.get_mut_ivar("markedText");
     let () = msg_send![(*marked_text_ref), release];
@@ -516,14 +562,33 @@ extern "C" fn valid_attributes_for_marked_text(_this: &Object, _sel: Sel) -> id 
 }
 
 extern "C" fn attributed_substring_for_proposed_range(
-  _this: &Object,
+  this: &Object,
   _sel: Sel,
-  _range: NSRange,
-  _actual_range: *mut c_void, // *mut NSRange
+  range: NSRange,
+  actual_range: *mut c_void, // *mut NSRange
 ) -> id {
   trace!("Triggered `attributedSubstringForProposedRange`");
-  trace!("Completed `attributedSubstringForProposedRange`");
-  nil
+  unsafe {
+    // Nucleus patch (nucleusframework#595 follow-up): the preedit is the only
+    // text this view can speak for, and `markedRange` advertises it at
+    // location 0. Returning `nil` for a range we just claimed to own is what
+    // makes ATOK / Kotoeri live conversion give up and commit nothing.
+    // Ranges outside the marked text stay `nil` — that text really is unknown
+    // to us, and `nil` is the documented answer for it.
+    let marked_text: &NSMutableAttributedString = *this.get_ivar("markedText");
+    let length = marked_text.length();
+    if length == 0 || range.location >= length {
+      trace!("Completed `attributedSubstringForProposedRange`");
+      return nil;
+    }
+    let clamped = NSRange::new(range.location, range.length.min(length - range.location));
+    if !actual_range.is_null() {
+      *(actual_range as *mut NSRange) = clamped;
+    }
+    let substring: id = msg_send![marked_text, attributedSubstringFromRange: clamped];
+    trace!("Completed `attributedSubstringForProposedRange`");
+    substring
+  }
 }
 
 extern "C" fn character_index_for_point(_this: &Object, _sel: Sel, _point: NSPoint) -> NSUInteger {
@@ -576,12 +641,24 @@ extern "C" fn insert_text(
       string
     };
 
-    let string: String = characters
-      .to_string()
+    let raw: String = characters.to_string();
+    let string: String = raw
       .chars()
       .filter(|c| !is_corporate_character(*c))
       .collect();
     state.is_key_down = true;
+
+    // Nucleus patch (nucleusframework#595 follow-up): when a conversion fails,
+    // ATOK / Kotoeri send a single Apple corporate (function-key) character
+    // instead of any text. Filtering leaves an empty string, and committing
+    // that would tear down the live composition and leave the preedit
+    // duplicated in the field. Emit nothing — but the key was still handled by
+    // the IME, so keep it away from the raw key path.
+    if string.is_empty() && !raw.is_empty() {
+      state.key_triggered_ime = true;
+      trace!("Completed `insertText` (dropped corporate-only payload)");
+      return;
+    }
 
     // We don't need this now, but it's here if that changes.
     //let event: id = msg_send![NSApp(), currentEvent];
